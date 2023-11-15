@@ -508,8 +508,8 @@ protected:
       for (auto & marker_pose : detection.markers) {
         geometry_msgs::msg::TransformStamped transform;
         transform.header.stamp = detection.header.stamp;
-        transform.header.frame_id = detection.header.frame_id;
-        transform.child_frame_id = std::string("marker_") + std::to_string(marker_pose.marker_id);
+        transform.header.frame_id = std::string("marker_") + std::to_string(marker_pose.marker_id);
+        transform.child_frame_id = detection.header.frame_id;
         tf2::Transform tf_transform;
         tf2::fromMsg(marker_pose.pose, tf_transform);
         transform.transform = tf2::toMsg(tf_transform);
