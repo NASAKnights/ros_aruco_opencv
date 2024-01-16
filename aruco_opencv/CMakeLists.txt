@@ -8,6 +8,7 @@ find_package(rclcpp_lifecycle REQUIRED)
 find_package(aruco_opencv_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(tf2_eigen REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(image_transport REQUIRED)
 find_package(OpenCV ${OpenCV_VERSION} REQUIRED COMPONENTS aruco)
@@ -22,6 +23,7 @@ target_link_libraries(${PROJECT_NAME}
   rclcpp_lifecycle::rclcpp_lifecycle
   rclcpp_components::component
   tf2_ros::tf2_ros
+  tf2_eigen::tf2_eigen
   tf2_geometry_msgs::tf2_geometry_msgs
   image_transport::image_transport
   opencv_aruco

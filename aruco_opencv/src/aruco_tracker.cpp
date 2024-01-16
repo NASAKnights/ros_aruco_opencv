@@ -33,7 +33,9 @@
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
+#include "tf2_eigen/tf2_eigen.hpp"
 #include "tf2_ros/transform_broadcaster.h"
+#include "tf2_ros/static_transform_broadcaster.h"
 #include "rcl_interfaces/msg/set_parameters_result.hpp"
 #include "sensor_msgs/msg/camera_info.hpp"
 #include "sensor_msgs/msg/image.hpp"
@@ -47,6 +49,78 @@
 
 using rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface;
 
+namespace YAML
+{
+	template<>
+	struct convert<geometry_msgs::msg::Transform>
+	{
+		static Node encode(const geometry_msgs::msg::Transform& rhs)
+		{
+			Node node;
+      node["translation"] = rhs.translation;
+			node["rotation"] = rhs.rotation;
+			return node;
+		}
+
+		static bool decode(const Node& node, geometry_msgs::msg::Transform& rhs)
+		{
+			rhs.translation = node["translation"].as<geometry_msgs::msg::Vector3>();
+			rhs.rotation = node["rotation"].as<geometry_msgs::msg::Quaternion>();
+			return true;
+		}
+	};
+
+  template<>
+	struct convert<geometry_msgs::msg::Vector3>
+	{
+		static Node encode(const geometry_msgs::msg::Vector3& rhs)
+		{
+			Node node;
+			node["x"] = rhs.x;
+			node["y"] = rhs.y;
+			node["z"] = rhs.z;
+			return node;
+		}
+
+		static bool decode(const Node& node, geometry_msgs::msg::Vector3& rhs)
+		{
+			if (node.size() != 3)
+				return false;
+
+			rhs.x = node["x"].as<double>();
+			rhs.y = node["y"].as<double>();
+			rhs.z = node["z"].as<double>();
+			return true;
+		}
+	};
+
+  template<>
+	struct convert<geometry_msgs::msg::Quaternion>
+	{
+		static Node encode(const geometry_msgs::msg::Quaternion& rhs)
+		{
+			Node node;
+			node["x"] = rhs.x;
+			node["y"] = rhs.y;
+			node["z"] = rhs.z;
+			node["w"] = rhs.w;
+			return node;
+		}
+
+		static bool decode(const Node& node, geometry_msgs::msg::Quaternion& rhs)
+		{
+			if (node.size() != 4)
+				return false;
+
+			rhs.x = node["x"].as<double>();
+			rhs.y = node["y"].as<double>();
+			rhs.z = node["z"].as<double>();
+			rhs.w = node["w"].as<double>();
+			return true;
+		}
+	};
+}
+
 namespace aruco_opencv
 {
 
@@ -59,6 +133,8 @@ class ArucoTracker : public rclcpp_lifecycle::LifecycleNode
   std::string marker_dict_;
   bool transform_poses_;
   bool publish_tf_;
+  bool markers_static_;
+  bool is_2d_ = true;
   double marker_size_;
   int image_sub_qos_reliability_;
   int image_sub_qos_durability_;
@@ -89,8 +165,10 @@ class ArucoTracker : public rclcpp_lifecycle::LifecycleNode
 
   // Tf2
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_broadcaster_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  std::vector<geometry_msgs::msg::TransformStamped> static_transforms_;
 
 public:
   explicit ArucoTracker(rclcpp::NodeOptions options)
@@ -116,16 +194,16 @@ public:
     }
 
     dictionary_ = cv::aruco::getPredefinedDictionary(ARUCO_DICT_MAP.at(marker_dict_));
+    
+    if (publish_tf_) {
+      tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+    }
 
     if (!board_descriptions_path_.empty()) {
       load_boards();
     }
 
     update_marker_obj_points();
-
-    if (publish_tf_) {
-      tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
-    }
 
     detection_pub_ = create_publisher<aruco_opencv_msgs::msg::ArucoDetection>(
       "aruco_detections", 5);
@@ -138,6 +216,8 @@ public:
   {
     RCLCPP_INFO(get_logger(), "Activating");
 
+    static_broadcaster_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(this);
+    static_broadcaster_->sendTransform(static_transforms_);
     if (transform_poses_) {
       tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
       tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -187,6 +267,7 @@ public:
     img_sub_.reset();
     tf_listener_.reset();
     tf_buffer_.reset();
+    tf_broadcaster_.reset();
 
     detection_pub_->on_deactivate();
     debug_pub_->on_deactivate();
@@ -239,6 +320,7 @@ protected:
       static_cast<int>(RMW_QOS_POLICY_DURABILITY_VOLATILE));
     declare_param(*this, "image_sub_qos.depth", 1);
     declare_param(*this, "publish_tf", true, true);
+    declare_param(*this, "markers_static", true, true);
     declare_param(*this, "marker_size", 0.15, true);
     declare_param(*this, "board_descriptions_path", "");
 
@@ -272,6 +354,11 @@ protected:
 
     get_parameter("publish_tf", publish_tf_);
     RCLCPP_INFO_STREAM(get_logger(), "TF publishing is " << (publish_tf_ ? "enabled" : "disabled"));
+
+    get_parameter("markers_static", markers_static_);
+    RCLCPP_INFO_STREAM(get_logger(), "Markers are set to " << 
+      (markers_static_ ? "static, publishing tf from marker to camera" 
+                       : "not static, publising tf from camera to marker"));
 
     get_param(*this, "marker_size", marker_size_, "Marker size: ");
 
@@ -337,14 +424,119 @@ protected:
       RCLCPP_ERROR_STREAM(get_logger(), "Failed to load board descriptions: " << e.what());
       return;
     }
+    
 
-    if (!descriptions.IsSequence()) {
-      RCLCPP_ERROR(get_logger(), "Failed to load board descriptions: root node is not a sequence");
+    if(!descriptions["is_2d"].IsDefined())
+    {
+      is_2d_ = true;
+    }
+    else
+    {
+      is_2d_ = descriptions["is_2d"].as<bool>();
+      descriptions.remove("is_2d");
     }
 
-    for (const YAML::Node & desc : descriptions) {
+    if(is_2d_)
+    {
+      loadGridBoard(descriptions);
+    }
+    else
+    {
+      loadBoard(descriptions);
+    }
+  }
+  
+  void loadBoard(YAML::Node descriptions)
+  {
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    auto boards = descriptions["boards"];
+    for (const auto& board_yaml : boards)
+    {
+      // Loop through Points
+      std::vector<std::vector<cv::Point3f>> all_points;
+      std::vector<int> ids;
+      auto board_name = board_yaml.first.as<std::string>();
+      auto board_sequence = board_yaml.second;
+      
+      for(const YAML::Node& marker: board_sequence)
+      {
+        // Get fields from YAML
+        ids.push_back(marker["ID"].as<int>());
+        auto marker_size = marker["marker_size"].as<double>();
+        auto transform_msg = marker["pose"].as<geometry_msgs::msg::Transform>();
+        std::vector<cv::Point3f> marker_points(4);
+        auto world2marker = tf2::transformToEigen(transform_msg);
+
+        // Setup vars to get corner positions from board center point pose
+        // Top Left -> Top Right -> Bottom Right -> Bottom Left
+        auto corner = Eigen::Vector3d(-marker_size/2.0, marker_size/2.0, 0.0); // Start at top left
+        Eigen::Matrix4d roll90;
+        roll90 << 1, 0, 0, 0,
+                0, 0, -1, 0,
+                0, 1, 0, 0,
+                0, 0, 0, 1;
+        Eigen::Matrix4d pitch90;
+        pitch90 <<0, 0, 1, 0,
+                0, 1, 0, 0,
+                -1, 0, 0, 0,
+                0, 0, 0, 1;
+        Eigen::Matrix4d yaw90;
+        yaw90 << 0, 1, 0, 0,
+                -1, 0, 0, 0,
+                0, 0, 1, 0,
+                0, 0, 0, 1;
+        Eigen::Isometry3d cornerRot(yaw90);
+        geometry_msgs::msg::TransformStamped transform = tf2::eigenToTransform(world2marker);
+        transform.header.stamp = get_clock()->now();
+        transform.header.frame_id = board_name;
+        transform.child_frame_id = std::string("marker_") + std::to_string(marker["ID"].as<int>());
+        static_transforms_.push_back(transform);
+        int i = 0;
+        for(auto& point : marker_points)
+        {
+          Eigen::Isometry3d world2corner(world2marker);
+          world2corner.translation() = world2marker * corner;
+
+          auto cornerCV = world2corner.translation();
+          point.x = cornerCV.x(); 
+          point.y = cornerCV.y();
+          point.z = cornerCV.z();
+          RCLCPP_INFO(get_logger(), "x; %f, y: %f, z:%f", point.x, point.y, point.z);
+          
+          corner = cornerRot*corner;
+          // Visualization
+          geometry_msgs::msg::TransformStamped transform = tf2::eigenToTransform(world2corner);
+          transform.header.stamp = get_clock()->now();
+          transform.header.frame_id = board_name;
+          transform.child_frame_id = std::string("marker_") + std::to_string(marker["ID"].as<int>()) + "_" + std::to_string(i);
+          static_transforms_.push_back(transform);
+          // Visualization
+          i++;
+        }
+
+        all_points.push_back(marker_points);
+      }
+
+      auto board = cv::aruco::Board::create(
+        all_points,
+        dictionary_, ids);
+
+      boards_.push_back(std::make_pair(board_name, board));
+
+    }
+    if(static_broadcaster_)
+    {
+      static_broadcaster_->sendTransform(static_transforms_);
+    }
+  }
+
+  void loadGridBoard(YAML::Node descriptions)
+  {
+    for (const YAML::Node & desc : descriptions)
+    {
       std::string name;
-      try {
+      try 
+      {
         name = desc["name"].as<std::string>();
         const bool frame_at_center = desc["frame_at_center"].as<bool>();
         const int markers_x = desc["markers_x"].as<int>();
@@ -366,14 +558,15 @@ protected:
             }
           }
         }
-
         boards_.push_back(std::make_pair(name, board));
-      } catch (const YAML::Exception & e) {
+      } 
+      catch (const YAML::Exception & e) 
+      {
         RCLCPP_ERROR_STREAM(get_logger(), "Failed to load board '" << name << "': " << e.what());
         continue;
       }
       RCLCPP_ERROR_STREAM(
-        get_logger(), "Successfully loaded configuration for board '" << name << "'");
+      get_logger(), "Successfully loaded configuration for board '" << name << "'");
     }
   }
 
@@ -444,7 +637,7 @@ protected:
     detection.header.frame_id = img_msg->header.frame_id;
     detection.header.stamp = img_msg->header.stamp;
     detection.markers.resize(n_markers);
-
+    bool found_board = false;
     {
       std::lock_guard<std::mutex> guard(cam_info_mutex_);
 
@@ -463,22 +656,33 @@ protected:
         });
 
       for (const auto & board_desc : boards_) {
-        std::string name = board_desc.first;
-        auto & board = board_desc.second;
+        if(marker_corners.size() >= 2 )
+        {
+          std::string name = board_desc.first;
+          auto & board = board_desc.second;
+          cv::Vec3d rvec, tvec;
+        
+          // custom
+          // cv::Mat objPoints, imgPoints;
+          // cv::aruco::getBoardObjectAndImagePoints(board, marker_corners, marker_ids, objPoints, imgPoints);
+          // int valid = cv::solvePnP(objPoints, imgPoints, camera_matrix_, distortion_coeffs_, rvec, tvec, false, cv::SOLVEPNP_ITERATIVE);
+          //custom
 
-        cv::Vec3d rvec, tvec;
-        int valid = cv::aruco::estimatePoseBoard(
-          marker_corners, marker_ids, board, camera_matrix_,
-          distortion_coeffs_, rvec, tvec);
+          int valid = cv::aruco::estimatePoseBoard(
+              marker_corners, marker_ids, board, camera_matrix_,
+              distortion_coeffs_, rvec, tvec);
 
-        if (valid > 0) {
-          aruco_opencv_msgs::msg::BoardPose bpose;
-          bpose.board_name = name;
-          bpose.pose = convert_rvec_tvec(rvec, tvec);
-          detection.boards.push_back(bpose);
-          rvec_final.push_back(rvec);
-          tvec_final.push_back(tvec);
-          n_markers++;
+
+          if (valid > 0) {
+            aruco_opencv_msgs::msg::BoardPose bpose;
+            bpose.board_name = name;
+            bpose.pose = convert_rvec_tvec(rvec, tvec);
+            detection.boards.push_back(bpose);
+            rvec_final.push_back(rvec);
+            tvec_final.push_back(tvec);
+            n_markers++;
+            found_board = true;
+          }
         }
       }
     }
@@ -505,23 +709,44 @@ protected:
 
     if (publish_tf_ && n_markers > 0) {
       std::vector<geometry_msgs::msg::TransformStamped> transforms;
-      for (auto & marker_pose : detection.markers) {
-        geometry_msgs::msg::TransformStamped transform;
-        transform.header.stamp = detection.header.stamp;
-        transform.header.frame_id = std::string("marker_") + std::to_string(marker_pose.marker_id);
-        transform.child_frame_id = detection.header.frame_id;
-        tf2::Transform tf_transform;
-        tf2::fromMsg(marker_pose.pose, tf_transform);
-        transform.transform = tf2::toMsg(tf_transform);
-        transforms.push_back(transform);
+      if(!found_board)
+      {
+        for (auto & marker_pose : detection.markers) {
+          geometry_msgs::msg::TransformStamped transform;
+          transform.header.stamp = detection.header.stamp;
+          tf2::Transform tf_transform;
+          tf2::fromMsg(marker_pose.pose, tf_transform);
+          if(!markers_static_)
+          {
+            transform.header.frame_id = detection.header.frame_id;
+            transform.child_frame_id = std::string("marker_") + std::to_string(marker_pose.marker_id);
+          }
+          else
+          {
+            tf_transform = tf_transform.inverse();
+            transform.header.frame_id = std::string("marker_") + std::to_string(marker_pose.marker_id);
+            transform.child_frame_id = detection.header.frame_id;
+          }
+          transform.transform = tf2::toMsg(tf_transform);
+          transforms.push_back(transform);
+        }
       }
       for (auto & board_pose : detection.boards) {
         geometry_msgs::msg::TransformStamped transform;
         transform.header.stamp = detection.header.stamp;
-        transform.header.frame_id = detection.header.frame_id;
-        transform.child_frame_id = std::string("board_") + board_pose.board_name;
         tf2::Transform tf_transform;
         tf2::fromMsg(board_pose.pose, tf_transform);
+        if(!markers_static_)
+        {
+          transform.header.frame_id = detection.header.frame_id;
+          transform.child_frame_id = std::string("board_") + board_pose.board_name;
+        }
+        else
+        {
+          tf_transform = tf_transform.inverse();
+          transform.header.frame_id = board_pose.board_name;
+          transform.child_frame_id = detection.header.frame_id;
+        }
         transform.transform = tf2::toMsg(tf_transform);
         transforms.push_back(transform);
       }
