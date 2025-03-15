@@ -131,6 +131,7 @@ class ArucoTracker : public rclcpp_lifecycle::LifecycleNode
   bool image_is_rectified_;
   std::string output_frame_;
   std::string marker_dict_;
+  std::string camera_frame_;
   bool transform_poses_;
   bool publish_tf_;
   bool markers_static_;
@@ -250,7 +251,7 @@ public:
     image_sub_qos.depth = image_sub_qos_depth_;
 
     auto qos = rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(image_sub_qos), image_sub_qos);
-
+    
     img_sub_ = create_subscription<sensor_msgs::msg::Image>(
       cam_base_topic_, qos, std::bind(
         &ArucoTracker::callback_image, this, std::placeholders::_1));
@@ -320,6 +321,7 @@ protected:
       static_cast<int>(RMW_QOS_POLICY_DURABILITY_VOLATILE));
     declare_param(*this, "image_sub_qos.depth", 1);
     declare_param(*this, "publish_tf", true, true);
+    declare_param(*this, "camera_frame", "");
     declare_param(*this, "markers_static", true, true);
     declare_param(*this, "marker_size", 0.15, true);
     declare_param(*this, "board_descriptions_path", "");
@@ -353,7 +355,9 @@ protected:
     get_parameter("image_sub_qos.depth", image_sub_qos_depth_);
 
     get_parameter("publish_tf", publish_tf_);
+    get_parameter("camera_frame", camera_frame_);
     RCLCPP_INFO_STREAM(get_logger(), "TF publishing is " << (publish_tf_ ? "enabled" : "disabled"));
+    RCLCPP_INFO_STREAM(get_logger(), "camera_frame is " << (camera_frame_));
 
     get_parameter("markers_static", markers_static_);
     RCLCPP_INFO_STREAM(get_logger(), "Markers are set to " << 
@@ -718,14 +722,22 @@ protected:
           tf2::fromMsg(marker_pose.pose, tf_transform);
           if(!markers_static_)
           {
-            transform.header.frame_id = detection.header.frame_id;
+            transform.header.frame_id = camera_frame_;
+            if(camera_frame_.size() == 0)
+            {
+              transform.header.frame_id = detection.header.frame_id;
+            }
             transform.child_frame_id = std::string("marker_") + std::to_string(marker_pose.marker_id);
           }
           else
           {
             tf_transform = tf_transform.inverse();
             transform.header.frame_id = std::string("marker_") + std::to_string(marker_pose.marker_id);
-            transform.child_frame_id = detection.header.frame_id;
+            transform.child_frame_id = camera_frame_;
+            if(camera_frame_.size() == 0)
+            {
+              transform.child_frame_id = detection.header.frame_id;
+            }
           }
           transform.transform = tf2::toMsg(tf_transform);
           transforms.push_back(transform);
@@ -738,13 +750,21 @@ protected:
         tf2::fromMsg(board_pose.pose, tf_transform);
         if(!markers_static_)
         {
-          transform.header.frame_id = detection.header.frame_id;
+          transform.header.frame_id = camera_frame_;
+          if(camera_frame_.size() == 0)
+          {
+            transform.header.frame_id = detection.header.frame_id;
+          }
           transform.child_frame_id = std::string("board_") + board_pose.board_name;
         }
         else
         {
           tf_transform = tf_transform.inverse();
           transform.header.frame_id = board_pose.board_name;
+          if(camera_frame_.size() == 0)
+          {
+            transform.child_frame_id = camera_frame_;
+          }
           transform.child_frame_id = detection.header.frame_id;
         }
         transform.transform = tf2::toMsg(tf_transform);
